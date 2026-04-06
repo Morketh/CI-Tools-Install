@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+
+import time
+import subprocess
+import sys
+import termios
+import tty
+import select
+import shutil
+from collections import deque
+
+from rich.live import Live
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.text import Text
+
+HISTORY = 120
+
+
+# ================= INPUT =================
+class KeyListener:
+    def __enter__(self):
+        self.fd = sys.stdin.fileno()
+        self.old = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *args):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def get(self):
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+
+# ================= UTILS =================
+def run(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True)
+    except:
+        return ""
+
+
+def term_width():
+    return shutil.get_terminal_size((120, 20)).columns
+
+
+def gradient_color(val, max_val):
+    ratio = val / max_val if max_val else 0
+
+    if ratio < 0.5:
+        return "green"
+    elif ratio < 0.75:
+        return "yellow"
+    else:
+        return "red"
+
+
+def sparkline(data, max_val=100, width=100):
+    bars = "▁▂▃▄▅▆▇█"
+    step = max(1, len(data) // width)
+
+    trimmed = list(data)[-width:]
+    text = Text()
+
+    for v in trimmed:
+        idx = int((v / max_val) * (len(bars) - 1)) if max_val else 0
+        color = gradient_color(v, max_val)
+        text.append(bars[idx], style=color)
+
+    return text
+
+
+# ================= SYSTEM =================
+def get_cpu():
+    out = run("grep '^cpu' /proc/stat").splitlines()
+    cores = []
+    for line in out[1:]:
+        parts = list(map(int, line.split()[1:]))
+        idle = parts[3]
+        total = sum(parts)
+        cores.append((idle, total))
+    return cores
+
+
+def get_battery():
+    dev = run("upower -e | grep BAT").strip()
+    out = run(f"upower -i {dev}")
+
+    data = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            data[k.strip()] = v.strip()
+
+    watts = data.get("energy-rate", "0 W").replace(" W", "")
+    return {
+        "pct": int(data.get("percentage", "0%").replace("%", "")),
+        "state": data.get("state", "unknown"),
+        "time": data.get("time to empty", data.get("time to full", "N/A")),
+        "watts": float(watts) if watts.replace(".", "").isdigit() else 0,
+    }
+
+
+def detect_gpu():
+    lspci = run("lspci").lower()
+    if "nvidia" in lspci:
+        return "nvidia"
+    if "amd" in lspci or "radeon" in lspci:
+        return "amd"
+    if "intel" in lspci:
+        return "intel"
+    return None
+
+
+def get_gpu(vendor):
+    if vendor == "nvidia":
+        out = run(
+            "nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits"
+        )
+        try:
+            u, t, p = out.strip().split(",")
+            return float(u), float(t), float(p)
+        except:
+            return 0, 0, 0
+    return 0, 0, 0
+
+
+def get_temps_fans():
+    out = run("sensors")
+
+    temps = []
+    fans = []
+
+    for line in out.splitlines():
+        if "°C" in line:
+            try:
+                temps.append(float(line.split("+")[1].split("°")[0]))
+            except:
+                pass
+        if "fan" in line.lower():
+            try:
+                fans.append(int(line.split(":")[1].split()[0]))
+            except:
+                pass
+
+    return temps[:4], fans[:4]
+
+
+# ================= UI =================
+def build_ui(batt, cpu_hist, gpu_hist, temp_hist, fan_hist, vendor):
+    width = term_width() - 10
+
+    # Battery color logic
+    batt_color = "green" if batt["state"] == "charging" else "red"
+
+    batt_text = Text()
+    batt_text.append("Charge: ", style="bold")
+    batt_text.append(f"{batt['pct']}% ", style=batt_color)
+
+    batt_text.append("\nPower: ", style="bold")
+    batt_text.append(f"{batt['watts']} W")
+
+    batt_text.append("\nState: ", style="bold")
+    batt_text.append(f"{batt['state']}", style=batt_color)
+
+    batt_text.append("\nTime: ", style="bold")
+    batt_text.append(f"{batt['time']}")
+
+    # CPU
+    cpu_lines = []
+    for i, hist in enumerate(cpu_hist):
+        cpu_lines.append(
+            Text.assemble(
+                (f"C{i:02d} ", "bold"),
+                sparkline(hist, 100, width),
+                (f" {hist[-1]:.1f}%", gradient_color(hist[-1], 100)),
+            )
+        )
+
+    # GPU
+    gpu_line = Text.assemble(
+        (f"{vendor or 'GPU'} ", "bold"),
+        sparkline(gpu_hist, 100, width),
+        (f" {gpu_hist[-1]:.1f}%" if gpu_hist else ""),
+    )
+
+    # Temps
+    temp_line = Text.assemble(
+        sparkline(temp_hist, max(temp_hist) if temp_hist else 1, width),
+        (f" {temp_hist[-1]:.1f}°C" if temp_hist else ""),
+    )
+
+    # Fans
+    fan_line = Text.assemble(
+        sparkline(fan_hist, max(fan_hist) if fan_hist else 1, width),
+        (f" {fan_hist[-1]:.0f} RPM" if fan_hist else ""),
+    )
+
+    layout = Layout()
+    layout.split_column(
+        Panel(batt_text, title="Battery"),
+        Panel(Text("\n").join(cpu_lines), title="CPU"),
+        Panel(gpu_line, title="GPU"),
+        Panel(temp_line, title="Temps"),
+        Panel(fan_line, title="Fans"),
+    )
+
+    return layout
+
+
+# ================= MAIN =================
+def main():
+    vendor = detect_gpu()
+
+    prev = get_cpu()
+    cpu_hist = [deque(maxlen=HISTORY) for _ in prev]
+    gpu_hist = deque(maxlen=HISTORY)
+    temp_hist = deque(maxlen=HISTORY)
+    fan_hist = deque(maxlen=HISTORY)
+
+    try:
+        with Live(refresh_per_second=4) as live:
+            with KeyListener() as key:
+                while True:
+                    if (k := key.get()) and k.lower() == "q":
+                        break
+
+                    batt = get_battery()
+
+                    # CPU
+                    curr = get_cpu()
+                    for i, ((i0, t0), (i1, t1)) in enumerate(zip(prev, curr)):
+                        diff_idle = i1 - i0
+                        diff_total = t1 - t0
+                        usage = 100 * (1 - diff_idle / diff_total) if diff_total else 0
+                        cpu_hist[i].append(usage)
+                    prev = curr
+
+                    # GPU
+                    u, temp, p = get_gpu(vendor)
+                    gpu_hist.append(u)
+
+                    # Temps / Fans
+                    temps, fans = get_temps_fans()
+                    if temps:
+                        temp_hist.append(sum(temps) / len(temps))
+                    if fans:
+                        fan_hist.append(sum(fans) / len(fans))
+
+                    live.update(
+                        build_ui(
+                            batt, cpu_hist, gpu_hist, temp_hist, fan_hist, vendor
+                        )
+                    )
+
+                    time.sleep(1)
+
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
